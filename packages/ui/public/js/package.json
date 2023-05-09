@@ -1,19 +1,19 @@
 {
-  "name": "@databerry/chat-bubble",
+  "name": "@flowise/chat-bubble",
   "version": "1.0.15",
-  "description": "databerry-one.vercel.app Chat Bubble Widget",
+  "description": "ai-api-jzxv.onrender.com Chat Bubble Widget",
   "main": "chat-bubble.js",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/gmpetrov/databerry.git"
+    "url": "git+https://github.com/Louvivien/Flowise.git"
   },
-  "author": "Georges Petrov",
+  "author": "Louvivien",
   "license": "MIT",
   "bugs": {
-    "url": "https://github.com/gmpetrov/databerry/issues"
+    "url": "https://github.com/Louvivien/Flowise/issues"
   },
-  "homepage": "https://github.com/gmpetrov/databerry#readme"
+  "homepage": "https://github.com/Louvivien/Flowise#readme"
 }
