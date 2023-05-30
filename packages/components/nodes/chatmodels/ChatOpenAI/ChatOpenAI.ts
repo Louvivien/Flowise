@@ -1,7 +1,6 @@
-import { OpenAIChatInput } from 'langchain/llms/openai'
 import { INode, INodeData, INodeParams } from '../../../src/Interface'
 import { getBaseClasses } from '../../../src/utils'
-import { ChatOpenAI } from 'langchain/chat_models/openai'
+import { ChatOpenAI, OpenAIChatInput } from 'langchain/chat_models/openai'
 
 class ChatOpenAI_ChatModels implements INode {
     label: string
@@ -110,11 +109,13 @@ class ChatOpenAI_ChatModels implements INode {
         const frequencyPenalty = nodeData.inputs?.frequencyPenalty as string
         const presencePenalty = nodeData.inputs?.presencePenalty as string
         const timeout = nodeData.inputs?.timeout as string
+        const streaming = nodeData.inputs?.streaming as boolean
 
         const obj: Partial<OpenAIChatInput> & { openAIApiKey?: string } = {
             temperature: parseInt(temperature, 10),
             modelName,
-            openAIApiKey
+            openAIApiKey,
+            streaming: streaming ?? true
         }
 
         if (maxTokens) obj.maxTokens = parseInt(maxTokens, 10)

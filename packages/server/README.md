@@ -20,6 +20,15 @@ Drag & drop UI to build your customized LLM flow using [LangchainJS](https://git
 
 3. Open [http://localhost:3000](http://localhost:3000)
 
+## 🔒 Authentication
+
+To enable app level authentication, add `FLOWISE_USERNAME` and `FLOWISE_PASSWORD` to the `.env` file:
+
+```
+FLOWISE_USERNAME=user
+FLOWISE_PASSWORD=1234
+```
+
 ## 📖 Documentation
 
 Coming Soon

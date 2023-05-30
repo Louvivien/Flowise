@@ -1,6 +1,7 @@
 import PropTypes from 'prop-types'
 import { Handle, Position, useUpdateNodeInternals } from 'reactflow'
 import { useEffect, useRef, useState, useContext } from 'react'
+import { useSelector } from 'react-redux'
 
 // material-ui
 import { useTheme, styled } from '@mui/material/styles'
@@ -15,6 +16,8 @@ import { File } from 'ui-component/file/File'
 import { SwitchInput } from 'ui-component/switch/Switch'
 import { flowContext } from 'store/context/ReactFlowContext'
 import { isValidConnection, getAvailableNodesForVariable } from 'utils/genericHelper'
+import { JsonEditorInput } from 'ui-component/json/JsonEditor'
+import { TooltipWithParser } from 'ui-component/tooltip/TooltipWithParser'
 
 const CustomWidthTooltip = styled(({ className, ...props }) => <Tooltip {...props} classes={{ popper: className }} />)({
     [`& .${tooltipClasses.tooltip}`]: {
@@ -26,6 +29,7 @@ const CustomWidthTooltip = styled(({ className, ...props }) => <Tooltip {...prop
 
 const NodeInputHandler = ({ inputAnchor, inputParam, data, disabled = false, isAdditionalParams = false }) => {
     const theme = useTheme()
+    const customization = useSelector((state) => state.customization)
     const ref = useRef(null)
     const { reactFlowInstance } = useContext(flowContext)
     const updateNodeInternals = useUpdateNodeInternals()
@@ -120,6 +124,7 @@ const NodeInputHandler = ({ inputAnchor, inputParam, data, disabled = false, isA
                             <Typography>
                                 {inputParam.label}
                                 {!inputParam.optional && <span style={{ color: 'red' }}>&nbsp;*</span>}
+                                {inputParam.description && <TooltipWithParser style={{ marginLeft: 10 }} title={inputParam.description} />}
                             </Typography>
                             <div style={{ flexGrow: 1 }}></div>
                             {inputParam.type === 'string' && inputParam.rows && (
@@ -164,6 +169,14 @@ const NodeInputHandler = ({ inputAnchor, inputParam, data, disabled = false, isA
                                 dialogProps={expandDialogProps}
                                 onDialogCancel={() => setShowExpandDialog(false)}
                                 onDialogConfirm={(newValue, inputParamName) => onExpandDialogSave(newValue, inputParamName)}
+                            />
+                        )}
+                        {inputParam.type === 'json' && (
+                            <JsonEditorInput
+                                disabled={disabled}
+                                onChange={(newValue) => (data.inputs[inputParam.name] = newValue)}
+                                value={data.inputs[inputParam.name] ?? inputParam.default ?? ''}
+                                isDarkMode={customization.isDarkMode}
                             />
                         )}
                         {inputParam.type === 'options' && (

@@ -14,7 +14,7 @@ import {
     INodeData,
     IOverrideConfig
 } from '../Interface'
-import { cloneDeep, get } from 'lodash'
+import { cloneDeep, get, omit, merge } from 'lodash'
 import { ICommonObject, getInputVariables } from 'flowise-components'
 import { scryptSync, randomBytes, timingSafeEqual } from 'crypto'
 
@@ -318,6 +318,25 @@ export const getVariableValue = (paramValue: string, reactFlowNodes: IReactFlowN
 }
 
 /**
+ * Temporarily disable streaming if vectorStore is Faiss
+ * @param {INodeData} flowNodeData
+ * @returns {boolean}
+ */
+export const isVectorStoreFaiss = (flowNodeData: INodeData) => {
+    if (flowNodeData.inputs && flowNodeData.inputs.vectorStoreRetriever) {
+        const vectorStoreRetriever = flowNodeData.inputs.vectorStoreRetriever
+        if (typeof vectorStoreRetriever === 'string' && vectorStoreRetriever.includes('faiss')) return true
+        if (
+            typeof vectorStoreRetriever === 'object' &&
+            vectorStoreRetriever.vectorStore &&
+            vectorStoreRetriever.vectorStore.constructor.name === 'FaissStore'
+        )
+            return true
+    }
+    return false
+}
+
+/**
  * Loop through each inputs and resolve variable if neccessary
  * @param {INodeData} reactFlowNodeData
  * @param {IReactFlowNode[]} reactFlowNodes
@@ -325,7 +344,12 @@ export const getVariableValue = (paramValue: string, reactFlowNodes: IReactFlowN
  * @returns {INodeData}
  */
 export const resolveVariables = (reactFlowNodeData: INodeData, reactFlowNodes: IReactFlowNode[], question: string): INodeData => {
-    const flowNodeData = cloneDeep(reactFlowNodeData)
+    let flowNodeData = cloneDeep(reactFlowNodeData)
+    if (reactFlowNodeData.instance && isVectorStoreFaiss(reactFlowNodeData)) {
+        // omit and merge because cloneDeep of instance gives "Illegal invocation" Exception
+        const flowNodeDataWithoutInstance = cloneDeep(omit(reactFlowNodeData, ['instance']))
+        flowNodeData = merge(flowNodeDataWithoutInstance, { instance: reactFlowNodeData.instance })
+    }
     const types = 'inputs'
 
     const getParamValues = (paramsObj: ICommonObject) => {
@@ -353,6 +377,12 @@ export const resolveVariables = (reactFlowNodeData: INodeData, reactFlowNodes: I
     return flowNodeData
 }
 
+/**
+ * Loop through each inputs and replace their value with override config values
+ * @param {INodeData} flowNodeData
+ * @param {ICommonObject} overrideConfig
+ * @returns {INodeData}
+ */
 export const replaceInputsWithConfig = (flowNodeData: INodeData, overrideConfig: ICommonObject) => {
     const types = 'inputs'
 
@@ -398,15 +428,22 @@ export const isSameOverrideConfig = (
     existingOverrideConfig?: ICommonObject,
     newOverrideConfig?: ICommonObject
 ): boolean => {
-    if (isInternal) return true
+    if (isInternal) {
+        if (existingOverrideConfig && Object.keys(existingOverrideConfig).length) return false
+        return true
+    }
+    // If existing and new overrideconfig are the same
     if (
         existingOverrideConfig &&
         Object.keys(existingOverrideConfig).length &&
         newOverrideConfig &&
         Object.keys(newOverrideConfig).length &&
         JSON.stringify(existingOverrideConfig) === JSON.stringify(newOverrideConfig)
-    )
+    ) {
         return true
+    }
+    // If there is no existing and new overrideconfig
+    if (!existingOverrideConfig && !newOverrideConfig) return true
     return false
 }
 
@@ -527,6 +564,19 @@ export const deleteAPIKey = async (keyIdToDelete: string): Promise<ICommonObject
 }
 
 /**
+ * Replace all api keys
+ * @param {ICommonObject[]} content
+ * @returns {Promise<void>}
+ */
+export const replaceAllAPIKeys = async (content: ICommonObject[]): Promise<void> => {
+    try {
+        await fs.promises.writeFile(getAPIKeyPath(), JSON.stringify(content), 'utf8')
+    } catch (error) {
+        console.error(error)
+    }
+}
+
+/**
  * Map MimeType to InputField
  * @param {string} mimeType
  * @returns {Promise<string>}
@@ -560,12 +610,7 @@ export const findAvailableConfigs = (reactFlowNodes: IReactFlowNode[]) => {
         for (const inputParam of flowNode.data.inputParams) {
             let obj: IOverrideConfig
             if (inputParam.type === 'password' || inputParam.type === 'options') {
-                obj = {
-                    node: flowNode.data.label,
-                    label: inputParam.label,
-                    name: inputParam.name,
-                    type: 'string'
-                }
+                continue
             } else if (inputParam.type === 'file') {
                 obj = {
                     node: flowNode.data.label,
@@ -588,4 +633,29 @@ export const findAvailableConfigs = (reactFlowNodes: IReactFlowNode[]) => {
     }
 
     return configs
+}
+
+/**
+ * Check to see if flow valid for stream
+ * @param {IReactFlowNode[]} reactFlowNodes
+ * @param {INodeData} endingNodeData
+ * @returns {boolean}
+ */
+export const isFlowValidForStream = (reactFlowNodes: IReactFlowNode[], endingNodeData: INodeData) => {
+    const streamAvailableLLMs = {
+        'Chat Models': ['azureChatOpenAI', 'chatOpenAI', 'chatAnthropic'],
+        LLMs: ['azureOpenAI', 'openAI']
+    }
+
+    let isChatOrLLMsExist = false
+    for (const flowNode of reactFlowNodes) {
+        const data = flowNode.data
+        if (data.category === 'Chat Models' || data.category === 'LLMs') {
+            isChatOrLLMsExist = true
+            const validLLMs = streamAvailableLLMs[data.category]
+            if (!validLLMs.includes(data.name)) return false
+        }
+    }
+
+    return isChatOrLLMsExist && endingNodeData.category === 'Chains' && !isVectorStoreFaiss(endingNodeData)
 }

@@ -4,8 +4,19 @@ import path from 'path'
 import cors from 'cors'
 import http from 'http'
 import * as fs from 'fs'
+import basicAuth from 'express-basic-auth'
+import { Server } from 'socket.io'
 
-import { IChatFlow, IncomingInput, IReactFlowNode, IReactFlowObject, INodeData } from './Interface'
+import {
+    IChatFlow,
+    IncomingInput,
+    IReactFlowNode,
+    IReactFlowObject,
+    INodeData,
+    IDatabaseExport,
+    IRunChatflowMessageValue,
+    IChildProcessMessage
+} from './Interface'
 import {
     getNodeModulesPackagePath,
     getStartingNodes,
@@ -21,7 +32,10 @@ import {
     compareKeys,
     mapMimeTypeToInputField,
     findAvailableConfigs,
-    isSameOverrideConfig
+    isSameOverrideConfig,
+    replaceAllAPIKeys,
+    isFlowValidForStream,
+    isVectorStoreFaiss
 } from './utils'
 import { cloneDeep } from 'lodash'
 import { getDataSource } from './DataSource'
@@ -30,6 +44,7 @@ import { ChatFlow } from './entity/ChatFlow'
 import { ChatMessage } from './entity/ChatMessage'
 import { ChatflowPool } from './ChatflowPool'
 import { ICommonObject } from 'flowise-components'
+import { fork } from 'child_process'
 
 export class App {
     app: express.Application
@@ -61,14 +76,26 @@ export class App {
             })
     }
 
-    async config() {
+    async config(socketIO?: Server) {
         // Limit is needed to allow sending/receiving base64 encoded string
         this.app.use(express.json({ limit: '50mb' }))
         this.app.use(express.urlencoded({ limit: '50mb', extended: true }))
 
-        // Allow access from ui when yarn run dev
-        if (process.env.NODE_ENV !== 'production') {
-            this.app.use(cors({ credentials: true, origin: 'http://localhost:8080' }))
+        // Allow access from *
+        this.app.use(cors())
+
+        if (process.env.FLOWISE_USERNAME && process.env.FLOWISE_PASSWORD) {
+            const username = process.env.FLOWISE_USERNAME
+            const password = process.env.FLOWISE_PASSWORD
+            const basicAuthMiddleware = basicAuth({
+                users: { [username]: password }
+            })
+            const whitelistURLs = ['/api/v1/prediction/', '/api/v1/node-icon/']
+            this.app.use((req, res, next) => {
+                if (req.url.includes('/api/v1/')) {
+                    whitelistURLs.some((url) => req.url.includes(url)) ? next() : basicAuthMiddleware(req, res, next)
+                } else next()
+            })
         }
 
         const upload = multer({ dest: `${path.join(__dirname, '..', 'uploads')}/` })
@@ -176,6 +203,30 @@ export class App {
             return res.json(results)
         })
 
+        // Check if chatflow valid for streaming
+        this.app.get('/api/v1/chatflows-streaming/:id', async (req: Request, res: Response) => {
+            const chatflow = await this.AppDataSource.getRepository(ChatFlow).findOneBy({
+                id: req.params.id
+            })
+            if (!chatflow) return res.status(404).send(`Chatflow ${req.params.id} not found`)
+
+            /*** Get Ending Node with Directed Graph  ***/
+            const flowData = chatflow.flowData
+            const parsedFlowData: IReactFlowObject = JSON.parse(flowData)
+            const nodes = parsedFlowData.nodes
+            const edges = parsedFlowData.edges
+            const { graph, nodeDependencies } = constructGraphs(nodes, edges)
+            const endingNodeId = getEndingNode(nodeDependencies, graph)
+            if (!endingNodeId) return res.status(500).send(`Ending node must be either a Chain or Agent`)
+            const endingNodeData = nodes.find((nd) => nd.id === endingNodeId)?.data
+            if (!endingNodeData) return res.status(500).send(`Ending node must be either a Chain or Agent`)
+
+            const obj = {
+                isStreaming: isFlowValidForStream(nodes, endingNodeData)
+            }
+            return res.json(obj)
+        })
+
         // ----------------------------------------
         // ChatMessage
         // ----------------------------------------
@@ -222,29 +273,55 @@ export class App {
             return res.json(availableConfigs)
         })
 
-        this.app.post('/api/v1/flow-config/:id', upload.array('files'), async (req: Request, res: Response) => {
-            const chatflow = await this.AppDataSource.getRepository(ChatFlow).findOneBy({
-                id: req.params.id
-            })
-            if (!chatflow) return res.status(404).send(`Chatflow ${req.params.id} not found`)
-            await this.validateKey(req, res, chatflow)
+        // ----------------------------------------
+        // Export Load Chatflow & ChatMessage & Apikeys
+        // ----------------------------------------
 
-            const overrideConfig: ICommonObject = { ...req.body }
-            const files = req.files as any[]
-            if (!files || !files.length) return
-
-            for (const file of files) {
-                const fileData = fs.readFileSync(file.path, { encoding: 'base64' })
-                const dataBase64String = `data:${file.mimetype};base64,${fileData},filename:${file.filename}`
-
-                const fileInputField = mapMimeTypeToInputField(file.mimetype)
-                if (overrideConfig[fileInputField]) {
-                    overrideConfig[fileInputField] = JSON.stringify([...JSON.parse(overrideConfig[fileInputField]), dataBase64String])
-                } else {
-                    overrideConfig[fileInputField] = JSON.stringify([dataBase64String])
-                }
+        this.app.get('/api/v1/database/export', async (req: Request, res: Response) => {
+            const chatmessages = await this.AppDataSource.getRepository(ChatMessage).find()
+            const chatflows = await this.AppDataSource.getRepository(ChatFlow).find()
+            const apikeys = await getAPIKeys()
+            const result: IDatabaseExport = {
+                chatmessages,
+                chatflows,
+                apikeys
             }
-            return res.json(overrideConfig)
+            return res.json(result)
+        })
+
+        this.app.post('/api/v1/database/load', async (req: Request, res: Response) => {
+            const databaseItems: IDatabaseExport = req.body
+
+            await this.AppDataSource.getRepository(ChatFlow).delete({})
+            await this.AppDataSource.getRepository(ChatMessage).delete({})
+
+            let error = ''
+
+            // Get a new query runner instance
+            const queryRunner = this.AppDataSource.createQueryRunner()
+
+            // Start a new transaction
+            await queryRunner.startTransaction()
+
+            try {
+                const chatflows: ChatFlow[] = databaseItems.chatflows
+                const chatmessages: ChatMessage[] = databaseItems.chatmessages
+
+                await queryRunner.manager.insert(ChatFlow, chatflows)
+                await queryRunner.manager.insert(ChatMessage, chatmessages)
+
+                await queryRunner.commitTransaction()
+            } catch (err: any) {
+                error = err?.message ?? 'Error loading database'
+                await queryRunner.rollbackTransaction()
+            } finally {
+                await queryRunner.release()
+            }
+
+            await replaceAllAPIKeys(databaseItems.apikeys)
+
+            if (error) return res.status(500).send(error)
+            return res.status(201).send('OK')
         })
 
         // ----------------------------------------
@@ -252,13 +329,13 @@ export class App {
         // ----------------------------------------
 
         // Send input message and get prediction result (External)
-        this.app.post('/api/v1/prediction/:id', async (req: Request, res: Response) => {
-            await this.processPrediction(req, res)
+        this.app.post('/api/v1/prediction/:id', upload.array('files'), async (req: Request, res: Response) => {
+            await this.processPrediction(req, res, socketIO)
         })
 
         // Send input message and get prediction result (Internal)
         this.app.post('/api/v1/internal-prediction/:id', async (req: Request, res: Response) => {
-            await this.processPrediction(req, res, true)
+            await this.processPrediction(req, res, socketIO, true)
         })
 
         // ----------------------------------------
@@ -329,6 +406,12 @@ export class App {
         })
     }
 
+    /**
+     * Validate API Key
+     * @param {Request} req
+     * @param {Response} res
+     * @param {ChatFlow} chatflow
+     */
     async validateKey(req: Request, res: Response, chatflow: ChatFlow) {
         const chatFlowApiKeyId = chatflow.apikeyid
         const authorizationHeader = (req.headers['Authorization'] as string) ?? (req.headers['authorization'] as string) ?? ''
@@ -343,10 +426,78 @@ export class App {
         }
     }
 
-    async processPrediction(req: Request, res: Response, isInternal = false) {
+    /**
+     * Start child process
+     * @param {ChatFlow} chatflow
+     * @param {IncomingInput} incomingInput
+     * @param {INodeData} endingNodeData
+     */
+    async startChildProcess(chatflow: ChatFlow, incomingInput: IncomingInput, endingNodeData?: INodeData) {
+        try {
+            const controller = new AbortController()
+            const { signal } = controller
+
+            let childpath = path.join(__dirname, '..', 'dist', 'ChildProcess.js')
+            if (!fs.existsSync(childpath)) childpath = 'ChildProcess.ts'
+
+            const childProcess = fork(childpath, [], { signal })
+
+            const value = {
+                chatflow,
+                incomingInput,
+                componentNodes: cloneDeep(this.nodesPool.componentNodes),
+                endingNodeData
+            } as IRunChatflowMessageValue
+            childProcess.send({ key: 'start', value } as IChildProcessMessage)
+
+            let childProcessTimeout: NodeJS.Timeout
+
+            return new Promise((resolve, reject) => {
+                childProcess.on('message', async (message: IChildProcessMessage) => {
+                    if (message.key === 'finish') {
+                        const { result, addToChatFlowPool } = message.value as ICommonObject
+                        if (childProcessTimeout) {
+                            clearTimeout(childProcessTimeout)
+                        }
+                        if (Object.keys(addToChatFlowPool).length) {
+                            const { chatflowid, nodeToExecuteData, startingNodes, overrideConfig } = addToChatFlowPool
+                            this.chatflowPool.add(chatflowid, nodeToExecuteData, startingNodes, overrideConfig)
+                        }
+                        resolve(result)
+                    }
+                    if (message.key === 'start') {
+                        if (process.env.EXECUTION_TIMEOUT) {
+                            childProcessTimeout = setTimeout(async () => {
+                                childProcess.kill()
+                                resolve(undefined)
+                            }, parseInt(process.env.EXECUTION_TIMEOUT, 10))
+                        }
+                    }
+                    if (message.key === 'error') {
+                        let errMessage = message.value as string
+                        if (childProcessTimeout) {
+                            clearTimeout(childProcessTimeout)
+                        }
+                        reject(errMessage)
+                    }
+                })
+            })
+        } catch (err) {
+            console.error(err)
+        }
+    }
+
+    /**
+     * Process Prediction
+     * @param {Request} req
+     * @param {Response} res
+     * @param {Server} socketIO
+     * @param {boolean} isInternal
+     */
+    async processPrediction(req: Request, res: Response, socketIO?: Server, isInternal = false) {
         try {
             const chatflowid = req.params.id
-            const incomingInput: IncomingInput = req.body
+            let incomingInput: IncomingInput = req.body
 
             let nodeToExecuteData: INodeData
 
@@ -359,85 +510,143 @@ export class App {
                 await this.validateKey(req, res, chatflow)
             }
 
+            let isStreamValid = false
+
+            const files = (req.files as any[]) || []
+
+            if (files.length) {
+                const overrideConfig: ICommonObject = { ...req.body }
+                for (const file of files) {
+                    const fileData = fs.readFileSync(file.path, { encoding: 'base64' })
+                    const dataBase64String = `data:${file.mimetype};base64,${fileData},filename:${file.filename}`
+
+                    const fileInputField = mapMimeTypeToInputField(file.mimetype)
+                    if (overrideConfig[fileInputField]) {
+                        overrideConfig[fileInputField] = JSON.stringify([...JSON.parse(overrideConfig[fileInputField]), dataBase64String])
+                    } else {
+                        overrideConfig[fileInputField] = JSON.stringify([dataBase64String])
+                    }
+                }
+                incomingInput = {
+                    question: req.body.question ?? 'hello',
+                    overrideConfig,
+                    history: []
+                }
+            }
+
             /* Don't rebuild the flow (to avoid duplicated upsert, recomputation) when all these conditions met:
              * - Node Data already exists in pool
              * - Still in sync (i.e the flow has not been modified since)
              * - Existing overrideConfig and new overrideConfig are the same
              * - Flow doesn't start with nodes that depend on incomingInput.question
              ***/
-            if (
-                Object.prototype.hasOwnProperty.call(this.chatflowPool.activeChatflows, chatflowid) &&
-                this.chatflowPool.activeChatflows[chatflowid].inSync &&
-                isSameOverrideConfig(
-                    isInternal,
-                    this.chatflowPool.activeChatflows[chatflowid].overrideConfig,
-                    incomingInput.overrideConfig
-                ) &&
-                !isStartNodeDependOnInput(this.chatflowPool.activeChatflows[chatflowid].startingNodes)
-            ) {
-                nodeToExecuteData = this.chatflowPool.activeChatflows[chatflowid].endingNodeData
+            const isRebuildNeeded = () => {
+                return (
+                    Object.prototype.hasOwnProperty.call(this.chatflowPool.activeChatflows, chatflowid) &&
+                    this.chatflowPool.activeChatflows[chatflowid].inSync &&
+                    isSameOverrideConfig(
+                        isInternal,
+                        this.chatflowPool.activeChatflows[chatflowid].overrideConfig,
+                        incomingInput.overrideConfig
+                    ) &&
+                    !isStartNodeDependOnInput(this.chatflowPool.activeChatflows[chatflowid].startingNodes)
+                )
+            }
+
+            if (process.env.EXECUTION_MODE === 'child') {
+                if (isRebuildNeeded()) {
+                    nodeToExecuteData = this.chatflowPool.activeChatflows[chatflowid].endingNodeData
+                    try {
+                        const result = await this.startChildProcess(chatflow, incomingInput, nodeToExecuteData)
+
+                        return res.json(result)
+                    } catch (error) {
+                        return res.status(500).send(error)
+                    }
+                } else {
+                    try {
+                        const result = await this.startChildProcess(chatflow, incomingInput)
+                        return res.json(result)
+                    } catch (error) {
+                        return res.status(500).send(error)
+                    }
+                }
             } else {
                 /*** Get chatflows and prepare data  ***/
-
                 const flowData = chatflow.flowData
                 const parsedFlowData: IReactFlowObject = JSON.parse(flowData)
                 const nodes = parsedFlowData.nodes
                 const edges = parsedFlowData.edges
 
-                /*** Get Ending Node with Directed Graph  ***/
-                const { graph, nodeDependencies } = constructGraphs(nodes, edges)
-                const directedGraph = graph
-                const endingNodeId = getEndingNode(nodeDependencies, directedGraph)
-                if (!endingNodeId) return res.status(500).send(`Ending node must be either a Chain or Agent`)
+                if (isRebuildNeeded()) {
+                    nodeToExecuteData = this.chatflowPool.activeChatflows[chatflowid].endingNodeData
+                    isStreamValid = isFlowValidForStream(nodes, nodeToExecuteData)
+                } else {
+                    /*** Get Ending Node with Directed Graph  ***/
+                    const { graph, nodeDependencies } = constructGraphs(nodes, edges)
+                    const directedGraph = graph
+                    const endingNodeId = getEndingNode(nodeDependencies, directedGraph)
+                    if (!endingNodeId) return res.status(500).send(`Ending node must be either a Chain or Agent`)
 
-                const endingNodeData = nodes.find((nd) => nd.id === endingNodeId)?.data
-                if (!endingNodeData) return res.status(500).send(`Ending node must be either a Chain or Agent`)
+                    const endingNodeData = nodes.find((nd) => nd.id === endingNodeId)?.data
+                    if (!endingNodeData) return res.status(500).send(`Ending node must be either a Chain or Agent`)
 
-                if (
-                    endingNodeData.outputs &&
-                    Object.keys(endingNodeData.outputs).length &&
-                    !Object.values(endingNodeData.outputs).includes(endingNodeData.name)
-                ) {
-                    return res
-                        .status(500)
-                        .send(
-                            `Output of ${endingNodeData.label} (${endingNodeData.id}) must be ${endingNodeData.label}, can't be an Output Prediction`
-                        )
+                    if (
+                        endingNodeData.outputs &&
+                        Object.keys(endingNodeData.outputs).length &&
+                        !Object.values(endingNodeData.outputs).includes(endingNodeData.name)
+                    ) {
+                        return res
+                            .status(500)
+                            .send(
+                                `Output of ${endingNodeData.label} (${endingNodeData.id}) must be ${endingNodeData.label}, can't be an Output Prediction`
+                            )
+                    }
+
+                    isStreamValid = isFlowValidForStream(nodes, endingNodeData)
+
+                    /*** Get Starting Nodes with Non-Directed Graph ***/
+                    const constructedObj = constructGraphs(nodes, edges, true)
+                    const nonDirectedGraph = constructedObj.graph
+                    const { startingNodeIds, depthQueue } = getStartingNodes(nonDirectedGraph, endingNodeId)
+
+                    /*** BFS to traverse from Starting Nodes to Ending Node ***/
+                    const reactFlowNodes = await buildLangchain(
+                        startingNodeIds,
+                        nodes,
+                        graph,
+                        depthQueue,
+                        this.nodesPool.componentNodes,
+                        incomingInput.question,
+                        incomingInput?.overrideConfig
+                    )
+
+                    const nodeToExecute = reactFlowNodes.find((node: IReactFlowNode) => node.id === endingNodeId)
+                    if (!nodeToExecute) return res.status(404).send(`Node ${endingNodeId} not found`)
+
+                    const reactFlowNodeData: INodeData = resolveVariables(nodeToExecute.data, reactFlowNodes, incomingInput.question)
+                    nodeToExecuteData = reactFlowNodeData
+
+                    const startingNodes = nodes.filter((nd) => startingNodeIds.includes(nd.id))
+                    this.chatflowPool.add(chatflowid, nodeToExecuteData, startingNodes, incomingInput?.overrideConfig)
                 }
 
-                /*** Get Starting Nodes with Non-Directed Graph ***/
-                const constructedObj = constructGraphs(nodes, edges, true)
-                const nonDirectedGraph = constructedObj.graph
-                const { startingNodeIds, depthQueue } = getStartingNodes(nonDirectedGraph, endingNodeId)
+                const nodeInstanceFilePath = this.nodesPool.componentNodes[nodeToExecuteData.name].filePath as string
+                const nodeModule = await import(nodeInstanceFilePath)
+                const nodeInstance = new nodeModule.nodeClass()
 
-                /*** BFS to traverse from Starting Nodes to Ending Node ***/
-                const reactFlowNodes = await buildLangchain(
-                    startingNodeIds,
-                    nodes,
-                    graph,
-                    depthQueue,
-                    this.nodesPool.componentNodes,
-                    incomingInput.question,
-                    incomingInput?.overrideConfig
-                )
+                isStreamValid = isStreamValid && !isVectorStoreFaiss(nodeToExecuteData)
 
-                const nodeToExecute = reactFlowNodes.find((node: IReactFlowNode) => node.id === endingNodeId)
-                if (!nodeToExecute) return res.status(404).send(`Node ${endingNodeId} not found`)
+                const result = isStreamValid
+                    ? await nodeInstance.run(nodeToExecuteData, incomingInput.question, {
+                          chatHistory: incomingInput.history,
+                          socketIO,
+                          socketIOClientId: incomingInput.socketIOClientId
+                      })
+                    : await nodeInstance.run(nodeToExecuteData, incomingInput.question, { chatHistory: incomingInput.history })
 
-                const reactFlowNodeData: INodeData = resolveVariables(nodeToExecute.data, reactFlowNodes, incomingInput.question)
-                nodeToExecuteData = reactFlowNodeData
-
-                const startingNodes = nodes.filter((nd) => startingNodeIds.includes(nd.id))
-                this.chatflowPool.add(chatflowid, nodeToExecuteData, startingNodes, incomingInput?.overrideConfig)
+                return res.json(result)
             }
-
-            const nodeInstanceFilePath = this.nodesPool.componentNodes[nodeToExecuteData.name].filePath as string
-            const nodeModule = await import(nodeInstanceFilePath)
-            const nodeInstance = new nodeModule.nodeClass()
-
-            const result = await nodeInstance.run(nodeToExecuteData, incomingInput.question, { chatHistory: incomingInput.history })
-
-            return res.json(result)
         } catch (e: any) {
             return res.status(500).send(e.message)
         }
@@ -461,8 +670,14 @@ export async function start(): Promise<void> {
     const port = parseInt(process.env.PORT || '', 10) || 3000
     const server = http.createServer(serverApp.app)
 
+    const io = new Server(server, {
+        cors: {
+            origin: '*'
+        }
+    })
+
     await serverApp.initDatabase()
-    await serverApp.config()
+    await serverApp.config(io)
 
     server.listen(port, () => {
         console.info(`⚡️[server]: Flowise Server is listening at ${port}`)
